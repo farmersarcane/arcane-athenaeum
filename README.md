@@ -1,36 +1,84 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Arcane Athenaeum
 
-## Getting Started
+A personal book catalog: every book you own, organized into shelves, and every
+book you want, on a wishlist. Barcode/ISBN lookup via Google Books, star
+ratings and reviews, ad hoc tags, reading status, series tracking, purchase and
+value records, and a loan tracker.
 
-First, run the development server:
+Built on the Makers Arcane brand system. Portfolio companion to
+`dustinwillis.pro/arcane-athenaeum`; the app itself is intended for
+`arcane-athenaeum.dustinwillis.pro`.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+## Stack
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+- Next.js 16.3 (App Router) + React 19, TypeScript
+- Tailwind CSS 4 (brand palette declared in `@theme` in `app/globals.css`)
+- Supabase (Postgres + Auth), its own isolated project
+- Google Books API for ISBN lookup
+- Native `BarcodeDetector` where available, `@zxing/browser` as fallback
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Note: Next 16 renamed Middleware to Proxy. Session refresh lives in
+`proxy.ts` at the project root, not `middleware.ts`.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Setup
 
-## Learn More
+1. Create a **new, isolated** Supabase project (do not reuse the Makers Arcane
+   or Farmers Arcane projects).
+2. Run `db/001_schema.sql` in the Supabase SQL editor. Apply to dev first,
+   verify, then prod.
+3. Copy `.env.local.example` to `.env.local` and fill it in.
+4. `npm install && npm run dev`
 
-To learn more about Next.js, take a look at the following resources:
+### Google Books API key
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+`GOOGLE_BOOKS_API_KEY` is effectively **required**. Without a key, requests use
+a shared anonymous Google project whose daily quota is routinely exhausted, and
+lookups return HTTP 429. Get a key from the Google Cloud console with the Books
+API enabled. It is read server-side only, in `app/api/lookup/route.ts`.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Data model
 
-## Deploy on Vercel
+One row per book: bibliographic metadata and ownership live together in
+`book`. Owning two physical copies of a title means two rows sharing an ISBN;
+duplicate detection warns at add time but never blocks. Ratings and reviews
+belong to the book row.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+`shelf` and `tag` are separate many-to-many concepts: a shelf is *where a book
+lives* (genre/topic), a tag is an ad hoc label ("signed copy", "gift from
+Mom"). `series` groups books with a `series_position`. `loan` records who has
+what, with a partial unique index allowing only one open loan per book and a
+generated `status` column derived from `date_returned` so it cannot drift.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Every table is protected by row-level security scoped to `auth.uid()`, and
+every server action re-checks the session because actions are reachable by
+direct POST.
+
+## Built so far
+
+Phases 1-6 of the build plan:
+
+1. Foundation - scaffold, auth, schema, brand system
+2. Core cataloging - add form, ISBN lookup, library grid, detail page
+3. Scanning - camera barcode scanning, batch scan mode
+4. Organization - shelves with cover previews, tags, wishlist and
+   "move to shelves", duplicate detection
+5. Engagement - reviews and ratings, three-state read status with dates,
+   series tracking
+6. Records - purchase/value info, loan tracking with badges
+
+Search and filtering shipped early, since the grid is unusable without it.
+
+## Not yet built
+
+- CSV import with column mapping and Goodreads auto-detect (phase 7)
+- Reading stats dashboard (phase 8)
+- Seeded public demo dataset, case-study page, subdomain wiring (phase 9)
+
+The `profile.is_demo` column exists for the demo account, but no anonymous read
+policies have been written yet - those land with the demo dataset.
+
+## v2 backlog
+
+Dark mode, self-hosted covers in Supabase Storage, PWA/offline scanning,
+printable inventory, scheduled backup exports, share cards, LibraryThing and
+StoryGraph import, half-star ratings.
