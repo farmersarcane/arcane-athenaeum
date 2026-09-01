@@ -42,3 +42,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Local agent worktrees (created by cloud/background agents)
+.claude/worktrees/
