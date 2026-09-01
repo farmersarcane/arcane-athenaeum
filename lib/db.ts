@@ -26,9 +26,30 @@ export async function getDb(): Promise<{ sql: Sql; userId: string }> {
   const token = await getToken()
   if (!token) throw new Error('You must be signed in to do that.')
 
-  const sql = neon(process.env.DATABASE_AUTHENTICATED_URL!, {
-    authToken: token,
-  })
+  const url = process.env.DATABASE_AUTHENTICATED_URL
+  if (!url) {
+    throw new Error('DATABASE_AUTHENTICATED_URL is not set.')
+  }
+
+  // Fail loudly if this points at an owner/admin role instead of Neon's
+  // passwordless `authenticated` role.
+  //
+  // Postgres exempts a table's owner from row-level security, so an owner
+  // connection here would not error - it would quietly satisfy every query
+  // while enforcing none of the policies in db/001_schema.sql, letting any
+  // signed-in user read every other user's library. Neon hands out the owner
+  // string (and a `_POOLED` variant of it) by default, which makes this an
+  // easy and invisible mistake. A hard failure is the only safe response.
+  if (/(^|[/:@])(neondb_owner|postgres)([:@]|$)/.test(url)) {
+    throw new Error(
+      'DATABASE_AUTHENTICATED_URL is pointing at an owner role. It must use ' +
+        "Neon's passwordless `authenticated` role, or row-level security is " +
+        'bypassed entirely. The owner string belongs in DATABASE_URL, which is ' +
+        'used only for running migrations.'
+    )
+  }
+
+  const sql = neon(url, { authToken: token })
 
   return { sql, userId }
 }
