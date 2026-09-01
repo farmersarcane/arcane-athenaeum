@@ -1,39 +1,16 @@
-import { createServerClient } from '@supabase/ssr'
-import { NextResponse, type NextRequest } from 'next/server'
+import { clerkMiddleware } from '@clerk/nextjs/server'
 
 // Next 16 renamed Middleware to Proxy; the file must sit at the project root
-// alongside `app`. Its only job here is refreshing the Supabase auth cookie so
-// server components see a live session. Route protection is enforced in
-// app/(app)/layout.tsx and inside every server action — not here, since a proxy
-// check alone is an optimistic check, not authorization.
-export async function proxy(request: NextRequest) {
-  let response = NextResponse.next({ request })
-
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return request.cookies.getAll()
-        },
-        setAll(cookiesToSet) {
-          cookiesToSet.forEach(({ name, value }) =>
-            request.cookies.set(name, value)
-          )
-          response = NextResponse.next({ request })
-          cookiesToSet.forEach(({ name, value, options }) =>
-            response.cookies.set(name, value, options)
-          )
-        },
-      },
-    }
-  )
-
-  await supabase.auth.getUser()
-
-  return response
-}
+// alongside `app`. Its only job here is making Clerk's auth context available
+// to every request (server components, server actions, route handlers all
+// call auth() downstream), which requires this to wrap the whole app. It does
+// NOT protect routes — Clerk's own guidance is that middleware/proxy is not
+// the place for that ("protect as close to the resource as possible"), which
+// matches how this app already worked under Supabase: the real gate is in
+// app/(app)/layout.tsx, and every server action re-checks the session via
+// requireUser(), because both are reachable by a direct request that a proxy
+// check alone would only optimistically redirect, not actually authorize.
+export default clerkMiddleware()
 
 export const config = {
   matcher: [

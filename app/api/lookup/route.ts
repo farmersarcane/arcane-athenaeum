@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase-server'
+import { getDb, type Sql } from '@/lib/db'
 import { lookupByIsbn, searchVolumes } from '@/lib/googleBooks'
 import { toIsbnPair, isValidIsbn, normalizeIsbn } from '@/lib/isbn'
 
@@ -8,13 +8,13 @@ import { toIsbnPair, isValidIsbn, normalizeIsbn } from '@/lib/isbn'
 // drives the duplicate warning in the add flow.
 
 export async function GET(request: Request) {
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-
   // Route handlers are reachable directly, so this check is the real gate.
-  if (!user) {
+  // getDb() throws when there is no signed-in Clerk user.
+  let sql: Sql
+  let userId: string
+  try {
+    ;({ sql, userId } = await getDb())
+  } catch {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
@@ -38,7 +38,7 @@ export async function GET(request: Request) {
       // duplicate warning has to render at the same moment as the autofill.
       const [candidates, duplicates] = await Promise.all([
         lookupByIsbn(isbn),
-        findDuplicates(supabase, user.id, isbn10, isbn13),
+        findDuplicates(sql, userId, isbn10, isbn13),
       ])
 
       return NextResponse.json({ candidates, duplicates })
@@ -76,10 +76,8 @@ export async function GET(request: Request) {
   }
 }
 
-type SupabaseClient = Awaited<ReturnType<typeof createClient>>
-
 async function findDuplicates(
-  supabase: SupabaseClient,
+  sql: Sql,
   userId: string,
   isbn10: string | null,
   isbn13: string | null
@@ -87,16 +85,16 @@ async function findDuplicates(
   const forms = [isbn10, isbn13].filter((v): v is string => Boolean(v))
   if (forms.length === 0) return []
 
-  const orFilter = forms
-    .flatMap((f) => [`isbn10.eq.${f}`, `isbn13.eq.${f}`])
-    .join(',')
+  // A book counts as a duplicate if either ISBN form on the scanned edition
+  // matches either ISBN form already on record — mirrors the original
+  // PostgREST `.or('isbn10.eq.a,isbn13.eq.a,isbn10.eq.b,isbn13.eq.b')`.
+  const rows = await sql`
+    select id, title, authors, cover_image_url, location, created_at
+    from book
+    where user_id = ${userId}
+      and deleted_at is null
+      and (isbn10 = any(${forms}::text[]) or isbn13 = any(${forms}::text[]))
+  `
 
-  const { data } = await supabase
-    .from('book')
-    .select('id, title, authors, cover_image_url, location, created_at')
-    .eq('user_id', userId)
-    .is('deleted_at', null)
-    .or(orFilter)
-
-  return data ?? []
+  return rows
 }

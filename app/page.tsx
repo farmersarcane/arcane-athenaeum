@@ -1,15 +1,12 @@
 import Link from 'next/link'
 import { redirect } from 'next/navigation'
-import { createClient } from '@/lib/supabase-server'
+import { auth } from '@clerk/nextjs/server'
 import { WaxSeal, InkFlourish } from '@/components/Ornaments'
 
 export default async function HomePage() {
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+  const { userId } = await auth()
 
-  if (user) redirect('/library')
+  if (userId) redirect('/library')
 
   return (
     <div className="parchment-tooth flex min-h-screen flex-col items-center justify-center px-5 py-16 text-center">

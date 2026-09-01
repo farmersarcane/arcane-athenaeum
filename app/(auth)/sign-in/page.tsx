@@ -1,37 +1,14 @@
-'use client'
+import { SignIn } from '@clerk/nextjs'
 
-import { useState } from 'react'
-import { useRouter } from 'next/navigation'
-import Link from 'next/link'
-import { createClient } from '@/lib/supabase-browser'
-
+// Clerk's hosted component replaces the old hand-rolled form (which called
+// Supabase Auth directly). The brand chrome — wax seal, wordmark, parchment
+// card — lives in app/(auth)/layout.tsx and wraps this either way; only the
+// form itself changes. Clerk's own header is hidden in favor of the same
+// heading the hand-rolled page used, so the card reads identically either
+// way. `appearance` here layers on top of the palette set globally in
+// app/layout.tsx's <ClerkProvider>, to fit this card shell instead of
+// Clerk's own boxed default.
 export default function SignInPage() {
-  const router = useRouter()
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
-
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault()
-    setError(null)
-    setLoading(true)
-
-    const supabase = createClient()
-    const { error } = await supabase.auth.signInWithPassword({ email, password })
-
-    if (error) {
-      setError(error.message)
-      setLoading(false)
-      return
-    }
-
-    router.push('/library')
-    // The app layout reads the session on the server, so the router cache has
-    // to be refreshed or the redirect can land back on a logged-out shell.
-    router.refresh()
-  }
-
   return (
     <>
       <h1
@@ -41,54 +18,35 @@ export default function SignInPage() {
         Sign in
       </h1>
 
-      <form onSubmit={handleSubmit} className="space-y-4">
-        <div>
-          <label className="label" htmlFor="email">Email</label>
-          <input
-            id="email"
-            type="email"
-            required
-            autoComplete="email"
-            className="field"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            placeholder="you@example.com"
-          />
-        </div>
-
-        <div>
-          <label className="label" htmlFor="password">Password</label>
-          <input
-            id="password"
-            type="password"
-            required
-            autoComplete="current-password"
-            className="field"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="Your password"
-          />
-        </div>
-
-        {error ? (
-          <p role="alert" className="text-[13px] text-wax">{error}</p>
-        ) : null}
-
-        <button
-          type="submit"
-          disabled={loading}
-          className="focus-ring w-full rounded-[8px] py-2.5 text-[15px] font-semibold text-eggshell bg-wax hover:bg-wax-hover disabled:opacity-60 cursor-pointer"
-        >
-          {loading ? 'Signing in...' : 'Sign in'}
-        </button>
-      </form>
-
-      <p className="mt-5 text-center text-[13px] text-muted">
-        No account yet?{' '}
-        <Link href="/sign-up" className="underline text-wax focus-ring rounded">
-          Create one
-        </Link>
-      </p>
+      <SignIn
+        routing="hash"
+        fallbackRedirectUrl="/library"
+        appearance={{
+          elements: {
+            rootBox: 'w-full',
+            cardBox: 'w-full shadow-none border-none',
+            card: 'w-full p-0 bg-transparent gap-4',
+            header: 'hidden',
+            footer: 'mt-5 bg-transparent',
+            footerAction: 'text-[13px] justify-center',
+            footerActionText: 'text-[13px] text-muted',
+            footerActionLink:
+              'text-wax underline hover:text-wax-hover focus-visible:outline-2 focus-visible:outline-wax rounded',
+            formButtonPrimary:
+              'focus-ring rounded-[8px] py-2.5 text-[15px] font-semibold text-eggshell bg-wax hover:bg-wax-hover normal-case shadow-none',
+            formFieldLabel: 'label',
+            formFieldInput: 'field',
+            formFieldInput__identifier: 'field',
+            dividerLine: 'bg-line',
+            dividerText: 'text-subtle text-[12px]',
+            socialButtonsBlockButton:
+              'border-line-strong text-ink hover:bg-sunk rounded-[8px]',
+            identityPreviewEditButton: 'text-wax',
+            formResendCodeLink: 'text-wax',
+            otpCodeFieldInput: 'field',
+          },
+        }}
+      />
     </>
   )
 }

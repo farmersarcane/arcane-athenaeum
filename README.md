@@ -13,21 +13,51 @@ Built on the Makers Arcane brand system. Portfolio companion to
 
 - Next.js 16.3 (App Router) + React 19, TypeScript
 - Tailwind CSS 4 (brand palette declared in `@theme` in `app/globals.css`)
-- Supabase (Postgres + Auth), its own isolated project
+- Neon (serverless Postgres) + Neon RLS ("Authorize"), its own isolated project
+- Clerk for hosted auth (sign-in/sign-up, session/JWT), free tier
 - Google Books API for ISBN lookup
 - Native `BarcodeDetector` where available, `@zxing/browser` as fallback
 
-Note: Next 16 renamed Middleware to Proxy. Session refresh lives in
-`proxy.ts` at the project root, not `middleware.ts`.
+Note: Next 16 renamed Middleware to Proxy. `proxy.ts` at the project root
+(not `middleware.ts`) just makes Clerk's auth context available to every
+request — it does not gate routes. See "Auth and authorization" below.
 
 ## Setup
 
-1. Create a **new, isolated** Supabase project (do not reuse the Makers Arcane
-   or Farmers Arcane projects).
-2. Run `db/001_schema.sql` in the Supabase SQL editor. Apply to dev first,
-   verify, then prod.
-3. Copy `.env.local.example` to `.env.local` and fill it in.
-4. `npm install && npm run dev`
+1. Create a **new, isolated** Neon project (do not reuse any other project).
+   In the Neon console, under RLS / Authorize, add Clerk as an authorization
+   provider (you'll need a Clerk application created first — see step 3 — to
+   get its JWKS URL). This provisions the `authenticated` Postgres role and
+   the `pg_session_jwt` extension that `db/001_schema.sql` relies on, and
+   gives you the second ("authenticated role") connection string.
+2. Run `db/001_schema.sql` against the project's owner connection string, in
+   the Neon SQL editor or via `psql`. Apply to a dev branch first, verify,
+   then prod.
+3. Create a Clerk application (email/password, or whatever sign-in methods
+   you want — the hosted `<SignIn />`/`<SignUp />` components in
+   `app/(auth)/` adapt automatically).
+4. Copy `.env.local.example` to `.env.local` and fill it in — both Neon
+   connection strings and both Clerk keys.
+5. `npm install && npm run dev`
+
+### Auth and authorization
+
+Clerk owns authentication (who the user is); Neon RLS owns authorization
+(which rows they can see). `proxy.ts` only wires up Clerk's auth context for
+the request. The actual gate for `/library`, `/add`, `/shelves`, `/wishlist`,
+`/loans`, and `/series` is `app/(app)/layout.tsx`, and every server action in
+`app/actions/*.ts` re-checks the session itself via `requireUser()` — both
+routes and actions are reachable by a direct request that a proxy check alone
+would only optimistically redirect, not actually authorize. Below that,
+`db/001_schema.sql`'s row-level security policies are the real backstop: a
+Neon connection opened with the wrong (or no) Clerk session simply cannot
+read or write another user's rows, regardless of what the application code
+does or doesn't check.
+
+A brand-new Clerk user has no `profile` row yet — `lib/db.ts`'s
+`ensureProfile()` upserts one on first authenticated request (see
+`db/001_schema.sql`'s comments for why this replaced Supabase's
+`auth.users` trigger).
 
 ### Google Books API key
 
@@ -49,9 +79,9 @@ Mom"). `series` groups books with a `series_position`. `loan` records who has
 what, with a partial unique index allowing only one open loan per book and a
 generated `status` column derived from `date_returned` so it cannot drift.
 
-Every table is protected by row-level security scoped to `auth.uid()`, and
-every server action re-checks the session because actions are reachable by
-direct POST.
+Every table is protected by row-level security scoped to `auth.user_id()`
+(Neon RLS's equivalent of Supabase's `auth.uid()`), and every server action
+re-checks the session because actions are reachable by direct POST.
 
 ## Built so far
 
@@ -79,6 +109,8 @@ policies have been written yet - those land with the demo dataset.
 
 ## v2 backlog
 
-Dark mode, self-hosted covers in Supabase Storage, PWA/offline scanning,
+Dark mode, self-hosted covers (Neon has no object storage product, so this
+means an S3-compatible bucket rather than the Supabase Storage this was
+originally scoped against), PWA/offline scanning,
 printable inventory, scheduled backup exports, share cards, LibraryThing and
 StoryGraph import, half-star ratings.

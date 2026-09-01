@@ -1,17 +1,22 @@
 import Link from 'next/link'
 import { redirect } from 'next/navigation'
-import { createClient } from '@/lib/supabase-server'
+import { auth } from '@clerk/nextjs/server'
+import { ensureProfile, getDb } from '@/lib/db'
 import { AppNav } from '@/components/AppNav'
 import { WaxSeal } from '@/components/Ornaments'
 
 export default async function AppLayout({ children }: LayoutProps<'/'>) {
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+  const { userId } = await auth()
 
-  // The real authorization gate. The proxy only refreshes the session cookie.
-  if (!user) redirect('/sign-in')
+  // The real authorization gate. The proxy only makes Clerk's auth context
+  // available to the request; it does not decide who gets in.
+  if (!userId) redirect('/sign-in')
+
+  // First authenticated request of a session (often the first ever, for a
+  // brand-new signup) is exactly when the profile row needs to exist —
+  // replaces the Supabase `handle_new_user()` trigger. See lib/db.ts.
+  const { sql } = await getDb()
+  await ensureProfile(sql, userId)
 
   return (
     <div className="min-h-screen flex flex-col">

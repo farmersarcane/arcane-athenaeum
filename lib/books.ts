@@ -1,4 +1,4 @@
-import { createClient } from '@/lib/supabase-server'
+import { tryGetDb, type Sql } from '@/lib/db'
 import type {
   Book,
   BookWithRelations,
@@ -13,37 +13,77 @@ import type {
 // Server-side reads. Every query is additionally scoped by user_id even though
 // RLS already enforces ownership — belt and braces, and it keeps the intent
 // readable at the call site.
+//
+// Under Supabase this file leaned on PostgREST's nested-select syntax
+// (`book_shelf ( shelf ( * ) )`, etc.) to fetch a book and its relations in
+// one request. Neon's SQL client has no such resource-embedding layer, so
+// each "join" below is an explicit query against the junction table, fetched
+// alongside the others and stitched together in JS by `attachRelations` —
+// the same shape getShelvesWithPreviews already used for its shelf/book
+// join even under Supabase.
 
-const BOOK_SELECT = `
-  *,
-  book_shelf ( shelf ( * ) ),
-  book_tag ( tag ( * ) ),
-  series ( * ),
-  loan ( * )
-`
+/** Attaches shelves, tags, series, and the active loan (if any) to a set of
+ *  bare `book` rows — the equivalent of the old PostgREST nested select. */
+async function attachRelations(
+  sql: Sql,
+  books: Book[]
+): Promise<BookWithRelations[]> {
+  if (books.length === 0) return []
 
-type RawBook = Book & {
-  book_shelf: { shelf: Shelf | null }[] | null
-  book_tag: { tag: Tag | null }[] | null
-  series: Series | null
-  loan: Loan[] | null
-}
+  const ids = books.map((b) => b.id)
+  const seriesIds = [...new Set(books.map((b) => b.series_id).filter((v): v is string => Boolean(v)))]
 
-function flatten(raw: RawBook): BookWithRelations {
-  const { book_shelf, book_tag, loan, ...book } = raw
-  return {
-    ...(book as Book),
-    shelves: (book_shelf ?? [])
-      .map((r) => r.shelf)
-      .filter((s): s is Shelf => Boolean(s))
-      .sort((a, b) => a.name.localeCompare(b.name)),
-    tags: (book_tag ?? [])
-      .map((r) => r.tag)
-      .filter((t): t is Tag => Boolean(t))
-      .sort((a, b) => a.name.localeCompare(b.name)),
-    series: raw.series ?? null,
-    active_loan: (loan ?? []).find((l) => l.date_returned === null) ?? null,
+  const [shelfLinksRaw, tagLinksRaw, loansRaw, seriesRaw] = await Promise.all([
+    sql`
+      select bs.book_id as book_id, s.*
+      from book_shelf bs
+      join shelf s on s.id = bs.shelf_id
+      where bs.book_id = any(${ids}::uuid[])
+    `,
+    sql`
+      select bt.book_id as book_id, t.*
+      from book_tag bt
+      join tag t on t.id = bt.tag_id
+      where bt.book_id = any(${ids}::uuid[])
+    `,
+    sql`
+      select * from loan
+      where book_id = any(${ids}::uuid[]) and date_returned is null
+    `,
+    seriesIds.length > 0
+      ? sql`select * from series where id = any(${seriesIds}::uuid[])`
+      : Promise.resolve([]),
+  ])
+
+  const shelfLinks = shelfLinksRaw as unknown as (Shelf & { book_id: string })[]
+  const tagLinks = tagLinksRaw as unknown as (Tag & { book_id: string })[]
+  const loans = loansRaw as unknown as Loan[]
+  const seriesRows = seriesRaw as unknown as Series[]
+
+  const shelvesByBook = new Map<string, Shelf[]>()
+  for (const { book_id, ...shelf } of shelfLinks) {
+    const list = shelvesByBook.get(book_id) ?? []
+    list.push(shelf as Shelf)
+    shelvesByBook.set(book_id, list)
   }
+
+  const tagsByBook = new Map<string, Tag[]>()
+  for (const { book_id, ...tag } of tagLinks) {
+    const list = tagsByBook.get(book_id) ?? []
+    list.push(tag as Tag)
+    tagsByBook.set(book_id, list)
+  }
+
+  const loanByBook = new Map(loans.map((l) => [l.book_id, l]))
+  const seriesById = new Map(seriesRows.map((s) => [s.id, s]))
+
+  return books.map((book) => ({
+    ...book,
+    shelves: (shelvesByBook.get(book.id) ?? []).sort((a, b) => a.name.localeCompare(b.name)),
+    tags: (tagsByBook.get(book.id) ?? []).sort((a, b) => a.name.localeCompare(b.name)),
+    series: book.series_id ? seriesById.get(book.series_id) ?? null : null,
+    active_loan: loanByBook.get(book.id) ?? null,
+  }))
 }
 
 export type BookFilters = {
@@ -62,45 +102,58 @@ export type BookFilters = {
 export async function getBooks(
   filters: BookFilters = {}
 ): Promise<BookWithRelations[]> {
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-  if (!user) return []
+  const db = await tryGetDb()
+  if (!db) return []
+  const { sql, userId } = db
 
-  let query = supabase
-    .from('book')
-    .select(BOOK_SELECT)
-    .eq('user_id', user.id)
-    .is('deleted_at', null)
+  const conditions = ['user_id = $1', 'deleted_at is null']
+  const params: unknown[] = [userId]
 
-  if (filters.location) query = query.eq('location', filters.location)
-  if (filters.readStatus) query = query.eq('read_status', filters.readStatus)
-  if (filters.format) query = query.eq('format', filters.format)
-  if (filters.seriesId) query = query.eq('series_id', filters.seriesId)
-  if (filters.author) query = query.contains('authors', [filters.author])
-
-  switch (filters.sort) {
-    case 'title':
-      query = query.order('title', { ascending: true })
-      break
-    case 'rating':
-      query = query.order('rating', { ascending: false, nullsFirst: false })
-      break
-    case 'pages':
-      query = query.order('page_count', { ascending: false, nullsFirst: false })
-      break
-    default:
-      query = query.order('created_at', { ascending: false })
+  if (filters.location) {
+    params.push(filters.location)
+    conditions.push(`location = $${params.length}`)
+  }
+  if (filters.readStatus) {
+    params.push(filters.readStatus)
+    conditions.push(`read_status = $${params.length}`)
+  }
+  if (filters.format) {
+    params.push(filters.format)
+    conditions.push(`format = $${params.length}`)
+  }
+  if (filters.seriesId) {
+    params.push(filters.seriesId)
+    conditions.push(`series_id = $${params.length}`)
+  }
+  if (filters.author) {
+    // authors is a text[] column — contains() maps to Postgres's @> operator.
+    params.push([filters.author])
+    conditions.push(`authors @> $${params.length}::text[]`)
   }
 
-  const { data, error } = await query
-  if (error) throw error
+  let orderBy = 'order by created_at desc'
+  switch (filters.sort) {
+    case 'title':
+      orderBy = 'order by title asc'
+      break
+    case 'rating':
+      orderBy = 'order by rating desc nulls last'
+      break
+    case 'pages':
+      orderBy = 'order by page_count desc nulls last'
+      break
+  }
 
-  let books = ((data ?? []) as unknown as RawBook[]).map(flatten)
+  const rows = (await sql.query(
+    `select * from book where ${conditions.join(' and ')} ${orderBy}`,
+    params
+  )) as Book[]
+
+  let books = await attachRelations(sql, rows)
 
   // Shelf, tag, author-sort, and loan filters run in JS: they depend on the
-  // joined rows, which PostgREST cannot filter without dropping parents.
+  // joined rows, which the base query above cannot filter without dropping
+  // parents (same tradeoff PostgREST forced here originally).
   if (filters.shelfId) {
     books = books.filter((b) => b.shelves.some((s) => s.id === filters.shelfId))
   }
@@ -111,10 +164,9 @@ export async function getBooks(
     books = books.filter((b) => b.active_loan !== null)
   }
   if (filters.search) {
-    // Matched in memory rather than via PostgREST's or(): authors is an array
-    // column that ilike cannot reach, and a server-side text filter combined
-    // with a separate author query would ignore the structural filters above.
-    // A personal library is small enough that this stays cheap.
+    // Matched in memory rather than in SQL: authors is an array column a
+    // simple ilike can't reach cleanly, and a personal library is small
+    // enough that this stays cheap.
     const term = filters.search.toLowerCase()
     books = books.filter((b) =>
       [b.title, b.subtitle, b.description, b.publisher, ...b.authors]
@@ -132,50 +184,42 @@ export async function getBooks(
 }
 
 export async function getBook(id: string): Promise<BookWithRelations | null> {
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-  if (!user) return null
+  const db = await tryGetDb()
+  if (!db) return null
+  const { sql, userId } = db
 
-  const { data, error } = await supabase
-    .from('book')
-    .select(BOOK_SELECT)
-    .eq('id', id)
-    .eq('user_id', user.id)
-    .is('deleted_at', null)
-    .maybeSingle()
+  const rows = (await sql`
+    select * from book
+    where id = ${id} and user_id = ${userId} and deleted_at is null
+  `) as Book[]
+  if (rows.length === 0) return null
 
-  if (error) throw error
-  if (!data) return null
-  return flatten(data as unknown as RawBook)
+  const [book] = await attachRelations(sql, rows)
+  return book
 }
 
 export async function getLoanHistory(bookId: string): Promise<Loan[]> {
-  const supabase = await createClient()
-  const { data, error } = await supabase
-    .from('loan')
-    .select('*')
-    .eq('book_id', bookId)
-    .order('date_loaned', { ascending: false })
-  if (error) throw error
-  return (data ?? []) as Loan[]
+  const db = await tryGetDb()
+  if (!db) return []
+  const { sql } = db
+  const rows = (await sql`
+    select * from loan
+    where book_id = ${bookId}
+    order by date_loaned desc
+  `) as Loan[]
+  return rows
 }
 
 export async function getShelves(): Promise<Shelf[]> {
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-  if (!user) return []
-  const { data, error } = await supabase
-    .from('shelf')
-    .select('*')
-    .eq('user_id', user.id)
-    .order('sort_order', { ascending: true })
-    .order('name', { ascending: true })
-  if (error) throw error
-  return (data ?? []) as Shelf[]
+  const db = await tryGetDb()
+  if (!db) return []
+  const { sql, userId } = db
+  const rows = (await sql`
+    select * from shelf
+    where user_id = ${userId}
+    order by sort_order asc, name asc
+  `) as Shelf[]
+  return rows
 }
 
 export type ShelfWithPreview = Shelf & {
@@ -189,109 +233,97 @@ export type ShelfWithPreview = Shelf & {
  * "preview of a book with the associated tag next to each shelf".
  */
 export async function getShelvesWithPreviews(): Promise<ShelfWithPreview[]> {
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-  if (!user) return []
-
-  const [shelvesRes, linksRes] = await Promise.all([
-    supabase
-      .from('shelf')
-      .select('*')
-      .eq('user_id', user.id)
-      .order('sort_order', { ascending: true })
-      .order('name', { ascending: true }),
-    supabase
-      .from('book_shelf')
-      .select('shelf_id, book ( id, title, cover_image_url, created_at, deleted_at )')
-      .order('created_at', { ascending: false }),
-  ])
-
-  if (shelvesRes.error) throw shelvesRes.error
+  const db = await tryGetDb()
+  if (!db) return []
+  const { sql, userId } = db
 
   type Link = {
     shelf_id: string
-    book: {
-      id: string
-      title: string
-      cover_image_url: string | null
-      created_at: string
-      deleted_at: string | null
-    } | null
+    id: string
+    title: string
+    cover_image_url: string | null
+    created_at: string
+    deleted_at: string | null
   }
 
-  const byShelf = new Map<string, Link['book'][]>()
-  for (const link of (linksRes.data ?? []) as unknown as Link[]) {
-    if (!link.book || link.book.deleted_at) continue
+  const [shelvesRaw, linksRaw] = await Promise.all([
+    sql`
+      select * from shelf
+      where user_id = ${userId}
+      order by sort_order asc, name asc
+    `,
+    sql`
+      select bs.shelf_id as shelf_id,
+             b.id as id, b.title as title, b.cover_image_url as cover_image_url,
+             b.created_at as created_at, b.deleted_at as deleted_at
+      from book_shelf bs
+      join book b on b.id = bs.book_id
+      join shelf s on s.id = bs.shelf_id
+      where s.user_id = ${userId}
+      order by b.created_at desc
+    `,
+  ])
+
+  const shelves = shelvesRaw as unknown as Shelf[]
+  const links = linksRaw as unknown as Link[]
+
+  const byShelf = new Map<string, Link[]>()
+  for (const link of links) {
+    if (link.deleted_at) continue
     const list = byShelf.get(link.shelf_id) ?? []
-    list.push(link.book)
+    list.push(link)
     byShelf.set(link.shelf_id, list)
   }
 
-  return ((shelvesRes.data ?? []) as Shelf[]).map((shelf) => {
+  return shelves.map((shelf) => {
     const books = byShelf.get(shelf.id) ?? []
     return {
       ...shelf,
       book_count: books.length,
       preview_covers: books.slice(0, 4).map((b) => ({
-        id: b!.id,
-        title: b!.title,
-        cover_image_url: b!.cover_image_url,
+        id: b.id,
+        title: b.title,
+        cover_image_url: b.cover_image_url,
       })),
     }
   })
 }
 
 export async function getTags(): Promise<Tag[]> {
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-  if (!user) return []
-  const { data, error } = await supabase
-    .from('tag')
-    .select('*')
-    .eq('user_id', user.id)
-    .order('name', { ascending: true })
-  if (error) throw error
-  return (data ?? []) as Tag[]
+  const db = await tryGetDb()
+  if (!db) return []
+  const { sql, userId } = db
+  const rows = (await sql`
+    select * from tag where user_id = ${userId} order by name asc
+  `) as Tag[]
+  return rows
 }
 
 export async function getSeriesList(): Promise<Series[]> {
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-  if (!user) return []
-  const { data, error } = await supabase
-    .from('series')
-    .select('*')
-    .eq('user_id', user.id)
-    .order('name', { ascending: true })
-  if (error) throw error
-  return (data ?? []) as Series[]
+  const db = await tryGetDb()
+  if (!db) return []
+  const { sql, userId } = db
+  const rows = (await sql`
+    select * from series where user_id = ${userId} order by name asc
+  `) as Series[]
+  return rows
 }
 
 /** Distinct author names across the catalog, for the author filter. Selects
  *  only the authors column so populating a dropdown never costs a second full
  *  library read. */
 export async function getAuthors(): Promise<string[]> {
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-  if (!user) return []
+  const db = await tryGetDb()
+  if (!db) return []
+  const { sql, userId } = db
 
-  const { data, error } = await supabase
-    .from('book')
-    .select('authors')
-    .eq('user_id', user.id)
-    .is('deleted_at', null)
-  if (error) throw error
+  const rows = (await sql`
+    select authors from book
+    where user_id = ${userId} and deleted_at is null
+  `) as { authors: string[] | null }[]
 
   const names = new Set<string>()
-  for (const row of (data ?? []) as { authors: string[] | null }[]) {
+  for (const row of rows) {
     for (const name of row.authors ?? []) if (name) names.add(name)
   }
   return [...names].sort((a, b) => a.localeCompare(b))

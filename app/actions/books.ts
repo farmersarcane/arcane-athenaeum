@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { requireUser } from './_auth'
 import { toIsbnPair } from '@/lib/isbn'
+import type { Sql } from '@/lib/db'
 import type { BookFormat, BookLocation, Condition, ReadStatus } from '@/lib/types'
 
 export type BookInput = {
@@ -48,36 +49,39 @@ function emptyToNull(v: string | null | undefined): string | null {
   return trimmed === '' ? null : trimmed
 }
 
-type Supabase = Awaited<ReturnType<typeof requireUser>>['supabase']
+type NamedTable = 'shelf' | 'tag' | 'series'
 
 /** Find-or-create by name, so the pickers can accept new values inline. */
 async function resolveNamed(
-  supabase: Supabase,
-  table: 'shelf' | 'tag' | 'series',
+  sql: Sql,
+  table: NamedTable,
   userId: string,
   names: string[]
 ): Promise<string[]> {
   const cleaned = [...new Set(names.map((n) => n.trim()).filter(Boolean))]
   if (cleaned.length === 0) return []
 
-  const { data: existing } = await supabase
-    .from(table)
-    .select('id, name')
-    .eq('user_id', userId)
-    .in('name', cleaned)
+  const existing =
+    table === 'shelf'
+      ? await sql`select id, name from shelf where user_id = ${userId} and name = any(${cleaned}::text[])`
+      : table === 'tag'
+        ? await sql`select id, name from tag where user_id = ${userId} and name = any(${cleaned}::text[])`
+        : await sql`select id, name from series where user_id = ${userId} and name = any(${cleaned}::text[])`
 
   const found = new Map(
-    ((existing ?? []) as { id: string; name: string }[]).map((r) => [r.name, r.id])
+    (existing as { id: string; name: string }[]).map((r) => [r.name, r.id])
   )
   const missing = cleaned.filter((n) => !found.has(n))
 
   if (missing.length > 0) {
-    const { data: inserted, error } = await supabase
-      .from(table)
-      .insert(missing.map((name) => ({ user_id: userId, name })))
-      .select('id, name')
-    if (error) throw error
-    for (const row of (inserted ?? []) as { id: string; name: string }[]) {
+    const inserted =
+      table === 'shelf'
+        ? await sql`insert into shelf (user_id, name) select ${userId}, unnest(${missing}::text[]) returning id, name`
+        : table === 'tag'
+          ? await sql`insert into tag (user_id, name) select ${userId}, unnest(${missing}::text[]) returning id, name`
+          : await sql`insert into series (user_id, name) select ${userId}, unnest(${missing}::text[]) returning id, name`
+
+    for (const row of inserted as { id: string; name: string }[]) {
       found.set(row.name, row.id)
     }
   }
@@ -86,17 +90,23 @@ async function resolveNamed(
 }
 
 async function setLinks(
-  supabase: Supabase,
+  sql: Sql,
   table: 'book_shelf' | 'book_tag',
-  column: 'shelf_id' | 'tag_id',
   bookId: string,
   ids: string[]
 ) {
-  await supabase.from(table).delete().eq('book_id', bookId)
-  if (ids.length === 0) return
-  const rows = [...new Set(ids)].map((id) => ({ book_id: bookId, [column]: id }))
-  const { error } = await supabase.from(table).insert(rows)
-  if (error) throw error
+  const uniq = [...new Set(ids)]
+  if (table === 'book_shelf') {
+    await sql`delete from book_shelf where book_id = ${bookId}`
+    if (uniq.length > 0) {
+      await sql`insert into book_shelf (book_id, shelf_id) select ${bookId}, unnest(${uniq}::uuid[])`
+    }
+  } else {
+    await sql`delete from book_tag where book_id = ${bookId}`
+    if (uniq.length > 0) {
+      await sql`insert into book_tag (book_id, tag_id) select ${bookId}, unnest(${uniq}::uuid[])`
+    }
+  }
 }
 
 function toRow(input: BookInput, userId: string) {
@@ -142,24 +152,40 @@ function toRow(input: BookInput, userId: string) {
 }
 
 export async function createBook(input: BookInput): Promise<{ id: string }> {
-  const { supabase, user } = await requireUser()
+  const { sql, user } = await requireUser()
 
   if (!input.title?.trim()) throw new Error('A title is required.')
 
   const [seriesIds, shelfIds, tagIds] = await Promise.all([
-    resolveNamed(supabase, 'series', user.id, input.series_name ? [input.series_name] : []),
-    resolveNamed(supabase, 'shelf', user.id, input.new_shelf_names ?? []),
-    resolveNamed(supabase, 'tag', user.id, input.new_tag_names ?? []),
+    resolveNamed(sql, 'series', user.id, input.series_name ? [input.series_name] : []),
+    resolveNamed(sql, 'shelf', user.id, input.new_shelf_names ?? []),
+    resolveNamed(sql, 'tag', user.id, input.new_tag_names ?? []),
   ])
 
-  const { data, error } = await supabase
-    .from('book')
-    .insert({ ...toRow(input, user.id), series_id: seriesIds[0] ?? null })
-    .select('id')
-    .single()
+  const row = toRow(input, user.id)
+  const seriesId = seriesIds[0] ?? null
 
-  if (error) throw error
-  const bookId = (data as { id: string }).id
+  const inserted = (await sql`
+    insert into book (
+      user_id, isbn10, isbn13, title, subtitle, authors, categories, publisher,
+      page_count, edition, format, description, cover_image_url, google_books_id,
+      language, published_date, location, condition, read_status, date_started,
+      date_finished, rating, review_text, date_reviewed, series_id, series_position,
+      price_paid, purchase_date, purchased_from, gift_from, estimated_value, notes
+    ) values (
+      ${row.user_id}, ${row.isbn10}, ${row.isbn13}, ${row.title}, ${row.subtitle},
+      ${row.authors}::text[], ${row.categories}::text[], ${row.publisher}, ${row.page_count},
+      ${row.edition}, ${row.format}, ${row.description}, ${row.cover_image_url},
+      ${row.google_books_id}, ${row.language}, ${row.published_date}, ${row.location},
+      ${row.condition}, ${row.read_status}, ${row.date_started}, ${row.date_finished},
+      ${row.rating}, ${row.review_text}, ${row.date_reviewed}, ${seriesId}, ${row.series_position},
+      ${row.price_paid}, ${row.purchase_date}, ${row.purchased_from}, ${row.gift_from},
+      ${row.estimated_value}, ${row.notes}
+    )
+    returning id
+  `) as { id: string }[]
+
+  const bookId = inserted[0].id
 
   // Wishlist entries are not physically shelved, so shelf links are ignored
   // for them even if the client sent some.
@@ -169,11 +195,8 @@ export async function createBook(input: BookInput): Promise<{ id: string }> {
       : [...(input.shelf_ids ?? []), ...shelfIds]
 
   await Promise.all([
-    setLinks(supabase, 'book_shelf', 'shelf_id', bookId, shelves),
-    setLinks(supabase, 'book_tag', 'tag_id', bookId, [
-      ...(input.tag_ids ?? []),
-      ...tagIds,
-    ]),
+    setLinks(sql, 'book_shelf', bookId, shelves),
+    setLinks(sql, 'book_tag', bookId, [...(input.tag_ids ?? []), ...tagIds]),
   ])
 
   revalidatePath('/library')
@@ -183,28 +206,56 @@ export async function createBook(input: BookInput): Promise<{ id: string }> {
 }
 
 export async function updateBook(id: string, input: BookInput): Promise<void> {
-  const { supabase, user } = await requireUser()
+  const { sql, user } = await requireUser()
 
   if (!input.title?.trim()) throw new Error('A title is required.')
 
   const [seriesIds, shelfIds, tagIds] = await Promise.all([
-    resolveNamed(supabase, 'series', user.id, input.series_name ? [input.series_name] : []),
-    resolveNamed(supabase, 'shelf', user.id, input.new_shelf_names ?? []),
-    resolveNamed(supabase, 'tag', user.id, input.new_tag_names ?? []),
+    resolveNamed(sql, 'series', user.id, input.series_name ? [input.series_name] : []),
+    resolveNamed(sql, 'shelf', user.id, input.new_shelf_names ?? []),
+    resolveNamed(sql, 'tag', user.id, input.new_tag_names ?? []),
   ])
 
   const row = toRow(input, user.id)
-  // user_id is immutable; leaving it in the update payload would let a crafted
-  // request try to reassign ownership.
-  delete (row as Partial<typeof row>).user_id
+  const seriesId = seriesIds[0] ?? null
 
-  const { error } = await supabase
-    .from('book')
-    .update({ ...row, series_id: seriesIds[0] ?? null })
-    .eq('id', id)
-    .eq('user_id', user.id)
-
-  if (error) throw error
+  // user_id is immutable and left out of the SET list entirely, so a crafted
+  // request can never reassign ownership through this path.
+  await sql`
+    update book set
+      isbn10 = ${row.isbn10},
+      isbn13 = ${row.isbn13},
+      title = ${row.title},
+      subtitle = ${row.subtitle},
+      authors = ${row.authors}::text[],
+      categories = ${row.categories}::text[],
+      publisher = ${row.publisher},
+      page_count = ${row.page_count},
+      edition = ${row.edition},
+      format = ${row.format},
+      description = ${row.description},
+      cover_image_url = ${row.cover_image_url},
+      google_books_id = ${row.google_books_id},
+      language = ${row.language},
+      published_date = ${row.published_date},
+      location = ${row.location},
+      condition = ${row.condition},
+      read_status = ${row.read_status},
+      date_started = ${row.date_started},
+      date_finished = ${row.date_finished},
+      rating = ${row.rating},
+      review_text = ${row.review_text},
+      date_reviewed = ${row.date_reviewed},
+      series_id = ${seriesId},
+      series_position = ${row.series_position},
+      price_paid = ${row.price_paid},
+      purchase_date = ${row.purchase_date},
+      purchased_from = ${row.purchased_from},
+      gift_from = ${row.gift_from},
+      estimated_value = ${row.estimated_value},
+      notes = ${row.notes}
+    where id = ${id} and user_id = ${user.id}
+  `
 
   const shelves =
     (input.location ?? 'shelf') === 'wishlist'
@@ -212,11 +263,8 @@ export async function updateBook(id: string, input: BookInput): Promise<void> {
       : [...(input.shelf_ids ?? []), ...shelfIds]
 
   await Promise.all([
-    setLinks(supabase, 'book_shelf', 'shelf_id', id, shelves),
-    setLinks(supabase, 'book_tag', 'tag_id', id, [
-      ...(input.tag_ids ?? []),
-      ...tagIds,
-    ]),
+    setLinks(sql, 'book_shelf', id, shelves),
+    setLinks(sql, 'book_tag', id, [...(input.tag_ids ?? []), ...tagIds]),
   ])
 
   revalidatePath('/library')
@@ -227,13 +275,11 @@ export async function updateBook(id: string, input: BookInput): Promise<void> {
 
 /** Soft delete, so an accidental removal is recoverable in the database. */
 export async function deleteBook(id: string): Promise<void> {
-  const { supabase, user } = await requireUser()
-  const { error } = await supabase
-    .from('book')
-    .update({ deleted_at: new Date().toISOString() })
-    .eq('id', id)
-    .eq('user_id', user.id)
-  if (error) throw error
+  const { sql, user } = await requireUser()
+  await sql`
+    update book set deleted_at = now()
+    where id = ${id} and user_id = ${user.id}
+  `
 
   revalidatePath('/library')
   revalidatePath('/wishlist')
@@ -246,18 +292,16 @@ export async function moveToShelves(
   shelfIds: string[],
   newShelfNames: string[] = []
 ): Promise<void> {
-  const { supabase, user } = await requireUser()
+  const { sql, user } = await requireUser()
 
-  const created = await resolveNamed(supabase, 'shelf', user.id, newShelfNames)
+  const created = await resolveNamed(sql, 'shelf', user.id, newShelfNames)
 
-  const { error } = await supabase
-    .from('book')
-    .update({ location: 'shelf' })
-    .eq('id', id)
-    .eq('user_id', user.id)
-  if (error) throw error
+  await sql`
+    update book set location = 'shelf'
+    where id = ${id} and user_id = ${user.id}
+  `
 
-  await setLinks(supabase, 'book_shelf', 'shelf_id', id, [...shelfIds, ...created])
+  await setLinks(sql, 'book_shelf', id, [...shelfIds, ...created])
 
   revalidatePath('/library')
   revalidatePath('/wishlist')
@@ -269,38 +313,37 @@ export async function setReadStatus(
   id: string,
   status: ReadStatus
 ): Promise<void> {
-  const { supabase, user } = await requireUser()
+  const { sql, user } = await requireUser()
 
   const today = new Date().toISOString().slice(0, 10)
-  const { data: current } = await supabase
-    .from('book')
-    .select('date_started, date_finished')
-    .eq('id', id)
-    .eq('user_id', user.id)
-    .maybeSingle()
-
-  const existing = current as { date_started: string | null; date_finished: string | null } | null
+  const rows = (await sql`
+    select date_started, date_finished from book
+    where id = ${id} and user_id = ${user.id}
+  `) as { date_started: string | null; date_finished: string | null }[]
+  const existing = rows[0] ?? null
 
   // Dates are filled in only when they are still blank, so re-marking a book
   // never overwrites a date the user entered by hand.
-  const patch: Record<string, string | null> = { read_status: status }
+  let dateStarted: string | null
+  let dateFinished: string | null
   if (status === 'reading') {
-    patch.date_started = existing?.date_started ?? today
-    patch.date_finished = null
+    dateStarted = existing?.date_started ?? today
+    dateFinished = null
   } else if (status === 'read') {
-    patch.date_started = existing?.date_started ?? today
-    patch.date_finished = existing?.date_finished ?? today
+    dateStarted = existing?.date_started ?? today
+    dateFinished = existing?.date_finished ?? today
   } else {
-    patch.date_started = null
-    patch.date_finished = null
+    dateStarted = null
+    dateFinished = null
   }
 
-  const { error } = await supabase
-    .from('book')
-    .update(patch)
-    .eq('id', id)
-    .eq('user_id', user.id)
-  if (error) throw error
+  await sql`
+    update book set
+      read_status = ${status},
+      date_started = ${dateStarted},
+      date_finished = ${dateFinished}
+    where id = ${id} and user_id = ${user.id}
+  `
 
   revalidatePath('/library')
   revalidatePath('/stats')
@@ -312,24 +355,22 @@ export async function saveReview(
   rating: number | null,
   reviewText: string | null
 ): Promise<void> {
-  const { supabase, user } = await requireUser()
+  const { sql, user } = await requireUser()
 
   if (rating !== null && (rating < 1 || rating > 5)) {
     throw new Error('Rating must be between 1 and 5.')
   }
 
   const text = emptyToNull(reviewText)
-  const { error } = await supabase
-    .from('book')
-    .update({
-      rating,
-      review_text: text,
-      date_reviewed:
-        rating || text ? new Date().toISOString().slice(0, 10) : null,
-    })
-    .eq('id', id)
-    .eq('user_id', user.id)
-  if (error) throw error
+  const dateReviewed = rating || text ? new Date().toISOString().slice(0, 10) : null
+
+  await sql`
+    update book set
+      rating = ${rating},
+      review_text = ${text},
+      date_reviewed = ${dateReviewed}
+    where id = ${id} and user_id = ${user.id}
+  `
 
   revalidatePath('/library')
   revalidatePath(`/library/${id}`)

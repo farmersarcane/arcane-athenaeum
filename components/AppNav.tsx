@@ -2,8 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { createClient } from '@/lib/supabase-browser'
-import { useRouter } from 'next/navigation'
+import { useClerk } from '@clerk/nextjs'
 
 const LINKS = [
   { href: '/library', label: 'Library' },
@@ -15,14 +14,7 @@ const LINKS = [
 
 export function AppNav() {
   const pathname = usePathname()
-  const router = useRouter()
-
-  async function signOut() {
-    const supabase = createClient()
-    await supabase.auth.signOut()
-    router.push('/sign-in')
-    router.refresh()
-  }
+  const { signOut } = useClerk()
 
   return (
     <nav
@@ -49,7 +41,7 @@ export function AppNav() {
       })}
       <button
         type="button"
-        onClick={signOut}
+        onClick={() => signOut({ redirectUrl: '/sign-in' })}
         className="focus-ring ml-auto shrink-0 rounded-[7px] px-3 py-1.5 text-[13px] text-subtle hover:text-ink cursor-pointer"
       >
         Sign out
